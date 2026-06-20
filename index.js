@@ -5,29 +5,27 @@ const app = express();
 app.use(express.json());
 
 // ─── CONFIG (set these as environment variables on Render) ─────────────────
-const VERIFY_TOKEN  = process.env.VERIFY_TOKEN  || "my_xerox_bot_token";
-const WA_TOKEN       = process.env.WA_TOKEN       || "YOUR_WHATSAPP_TOKEN";
-const PHONE_ID        = process.env.PHONE_ID        || "YOUR_PHONE_NUMBER_ID";
-const OWNER_PHONE     = process.env.OWNER_PHONE     || "91XXXXXXXXXX"; // your personal number, no +
-const UPSTASH_URL     = process.env.UPSTASH_URL     || ""; // e.g. https://xxxx.upstash.io
-const UPSTASH_TOKEN   = process.env.UPSTASH_TOKEN   || "";
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "my_xerox_bot_token";
+const WA_TOKEN      = process.env.WA_TOKEN      || "YOUR_WHATSAPP_TOKEN";
+const PHONE_ID       = process.env.PHONE_ID       || "YOUR_PHONE_NUMBER_ID";
+const OWNER_PHONE    = process.env.OWNER_PHONE    || "91XXXXXXXXXX";
+const UPSTASH_URL    = process.env.UPSTASH_URL    || "";
+const UPSTASH_TOKEN  = process.env.UPSTASH_TOKEN  || "";
 // ──────────────────────────────────────────────────────────────────────────
 
 // ─── PRICE LIST — hidden from customers, used only for backend calculation ─
-// Edit these numbers any time your rates change. Nothing here is ever shown
-// to the customer in chat.
 const RATES = {
-  bwPerPage: 3,              // B&W, single side or back-to-back — same rate
-  colorPlain: {              // Color print on plain paper — tiered by total pages
-    tier1: { max: 10, rate: 10 },   // up to 10 pages
-    tier2: { max: 30, rate: 7 },    // 11–30 pages
-    tier3: { max: Infinity, rate: 6 } // more than 30 pages
+  bwPerPage: 3,
+  colorPlain: {
+    tier1: { max: 10, rate: 10 },
+    tier2: { max: 30, rate: 7 },
+    tier3: { max: Infinity, rate: 6 }
   },
-  colorGlossyPerPage: 30,
-  spiralBinding: 50,         // flat, up to 60 pages
-  hardBinding: 230,          // flat, with golden embossing
-  laminationCard: 20,        // per card
-  laminationA4: 30           // per A4 sheet
+  spiralBinding: 50,
+  hardBinding: 230
+  // Lamination (Card ₹20 / A4 ₹30) and Glossy Color (₹30/page) are handled
+  // manually in-shop, not tracked by the bot — mentioned only as an upsell
+  // in the order-confirmation message.
 };
 
 function colorPlainRate(totalPrints) {
@@ -39,28 +37,41 @@ function colorPlainRate(totalPrints) {
 function calculatePrice(data) {
   const pages = parseInt(data.pages) || 1;
   const copies = parseInt(data.copies) || 1;
-  const totalPrints = pages * copies; // total physical sheets printed
+  const totalPrints = pages * copies;
 
   let printCost = 0;
-  if (data.printType === "bw") {
-    printCost = totalPrints * RATES.bwPerPage;
-  } else if (data.printType === "color_plain") {
-    printCost = totalPrints * colorPlainRate(totalPrints);
-  } else if (data.printType === "color_glossy") {
-    printCost = totalPrints * RATES.colorGlossyPerPage;
-  }
+  if (data.printType === "bw") printCost = totalPrints * RATES.bwPerPage;
+  else if (data.printType === "color") printCost = totalPrints * colorPlainRate(totalPrints);
 
   let bindingCost = 0;
   if (data.binding === "spiral") bindingCost = RATES.spiralBinding;
   else if (data.binding === "hard") bindingCost = RATES.hardBinding;
 
-  let laminationCost = 0;
-  const lamQty = parseInt(data.laminationQty) || 0;
-  if (data.lamination === "card") laminationCost = lamQty * RATES.laminationCard;
-  else if (data.lamination === "a4") laminationCost = lamQty * RATES.laminationA4;
+  const total = printCost + bindingCost;
+  return { totalPrints, printCost, bindingCost, total };
+}
 
-  const total = printCost + bindingCost + laminationCost;
-  return { totalPrints, printCost, bindingCost, laminationCost, total };
+// Parses things like "1-5, 8, 10" into a page count. Returns null if unclear.
+function parsePageRange(str) {
+  try {
+    const parts = str.split(",").map((s) => s.trim()).filter(Boolean);
+    if (parts.length === 0) return null;
+    let total = 0;
+    for (const part of parts) {
+      if (part.includes("-")) {
+        const [a, b] = part.split("-").map((n) => parseInt(n.trim()));
+        if (isNaN(a) || isNaN(b) || b < a) return null;
+        total += b - a + 1;
+      } else {
+        const n = parseInt(part);
+        if (isNaN(n)) return null;
+        total += 1;
+      }
+    }
+    return total > 0 ? total : null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── PERSISTENT DAILY STATS (Upstash Redis REST API) ───────────────────────
@@ -101,13 +112,10 @@ async function getTodayStats() {
   return stats;
 }
 
-// ─── In-memory session store  { phone: { step, data } } ────────────────────
+// ─── Session store ───────────────────────────────────────────────────────
 const sessions = {};
-
 function getSession(phone) {
-  if (!sessions[phone]) {
-    sessions[phone] = { step: "WELCOME", data: {} };
-  }
+  if (!sessions[phone]) sessions[phone] = { step: "WELCOME", data: {} };
   return sessions[phone];
 }
 
@@ -136,31 +144,22 @@ async function sendButtons(to, body, buttons) {
   );
 }
 
-// Order summary shown to CUSTOMER — no prices, ever.
 function buildCustomerSummary(data) {
-  const printLabel =
-    data.printType === "bw"
-      ? `Black & White (${data.bwSide === "back2back" ? "Back-to-Back" : "Single Side"})`
-      : data.printType === "color_glossy"
-      ? "Color — Glossy Paper"
-      : "Color — Plain Paper";
-
-  return (
-    `📋 *ORDER SUMMARY*\n` +
-    `─────────────────────\n` +
-    `📄 File: ${data.file || "Sent via WhatsApp"}\n` +
-    `📃 Pages: ${data.pages}\n` +
-    `🔢 Copies: ${data.copies}\n` +
-    `🎨 Print: ${printLabel}\n` +
-    `📚 Binding: ${data.binding === "spiral" ? "Spiral Binding" : data.binding === "hard" ? "Hard Binding" : "None"}\n` +
-    `✨ Lamination: ${data.lamination === "none" || !data.lamination ? "None" : `${data.lamination === "card" ? "Card" : "A4"} x${data.laminationQty}`}\n` +
-    `⚡ Urgency: ${data.urgency}\n` +
-    `🚚 Delivery: ${data.delivery}\n` +
-    (data.address ? `📍 Address: ${data.address}\n` : "") +
-    `💳 Payment: ${data.payment}\n` +
-    `─────────────────────\n` +
-    `Thank you! We'll confirm your order shortly. 🙏`
-  );
+  const lines = [
+    `📋 *ORDER SUMMARY*`,
+    `─────────────`,
+    `📄 File: ${data.file}`,
+    `🎨 ${data.printType === "bw" ? "Black & White" : "Color"}`,
+    `📃 Pages: ${data.pages}`,
+    `🔢 Copies: ${data.copies}`,
+    `📐 Size: ${data.size}`,
+  ];
+  if (data.binding) lines.push(`📚 Binding: ${data.binding === "spiral" ? "Spiral" : "Hard Binding"}`);
+  lines.push(`🚚 ${data.delivery}`);
+  if (data.address) lines.push(`📍 ${data.address}`);
+  if (data.payment) lines.push(`💳 ${data.payment}`);
+  lines.push(`─────────────`, `Confirm?`);
+  return lines.join("\n");
 }
 
 async function handleMessage(phone, msgType, msgBody) {
@@ -168,31 +167,97 @@ async function handleMessage(phone, msgType, msgBody) {
   const { step, data } = session;
 
   if (step === "WELCOME") {
-    await sendMessage(phone, `👋 Welcome to *PrintEasy Xerox & Print Services!*\n\nLet's get your order started.`);
-    await sendMessage(phone, `📎 *Step 1* — Please send the *file* you want printed (PDF, Word, image, etc.)`);
-    session.step = "ASK_FILE";
+    await sendButtons(phone, `👋 Welcome to *PrintEasy*! What do you need?`, [
+      { id: "svc_print", title: "🖨️ Print" },
+      { id: "svc_binding", title: "📚 Binding" },
+    ]);
+    session.step = "ASK_SERVICE";
+    return;
+  }
+
+  if (step === "ASK_SERVICE") {
+    if (msgBody === "svc_print" || msgBody === "svc_binding") {
+      data.service = msgBody === "svc_binding" ? "binding" : "print";
+      await sendMessage(phone, `📎 Send your document (PDF/Word/Image)`);
+      session.step = "ASK_FILE";
+    } else {
+      await sendButtons(phone, `Please choose:`, [
+        { id: "svc_print", title: "🖨️ Print" },
+        { id: "svc_binding", title: "📚 Binding" },
+      ]);
+    }
     return;
   }
 
   if (step === "ASK_FILE") {
     if (msgType === "document" || msgType === "image") {
-      data.file = `File received (${msgType})`;
-      await sendMessage(phone, `✅ File received!\n\n📃 *Step 2* — How many *pages* is the document?\nJust type a number.`);
-      session.step = "ASK_PAGES";
+      data.file = `Received (${msgType})`;
+      await sendButtons(phone, `B&W or Color?`, [
+        { id: "color_bw", title: "⬛ B&W" },
+        { id: "color_color", title: "🌈 Color" },
+      ]);
+      session.step = "ASK_COLOR";
     } else {
-      await sendMessage(phone, `Please send the file as a document or image. 📎`);
+      await sendMessage(phone, `Please send a document or image 📎`);
     }
     return;
   }
 
-  if (step === "ASK_PAGES") {
+  if (step === "ASK_COLOR") {
+    if (msgBody === "color_bw" || msgBody === "color_color") {
+      data.printType = msgBody === "color_color" ? "color" : "bw";
+      await sendButtons(phone, `Print which pages?`, [
+        { id: "pg_all", title: "All Pages" },
+        { id: "pg_specific", title: "Specific Pages" },
+      ]);
+      session.step = "ASK_PAGE_MODE";
+    } else {
+      await sendButtons(phone, `Please choose:`, [
+        { id: "color_bw", title: "⬛ B&W" },
+        { id: "color_color", title: "🌈 Color" },
+      ]);
+    }
+    return;
+  }
+
+  if (step === "ASK_PAGE_MODE") {
+    if (msgBody === "pg_all") {
+      await sendMessage(phone, `How many pages in total?`);
+      session.step = "ASK_PAGE_COUNT";
+    } else if (msgBody === "pg_specific") {
+      await sendMessage(phone, `Which pages? (e.g. 1-5, 8, 10)`);
+      session.step = "ASK_SPECIFIC_PAGES";
+    } else {
+      await sendButtons(phone, `Please choose:`, [
+        { id: "pg_all", title: "All Pages" },
+        { id: "pg_specific", title: "Specific Pages" },
+      ]);
+    }
+    return;
+  }
+
+  if (step === "ASK_SPECIFIC_PAGES") {
+    const count = parsePageRange(msgBody || "");
+    if (count) {
+      data.pages = count;
+      data.pageRange = msgBody;
+      await sendMessage(phone, `🔢 How many copies (sets)?`);
+      session.step = "ASK_COPIES";
+    } else {
+      await sendMessage(phone, `Couldn't read that — how many pages total? (number)`);
+      session.step = "ASK_PAGE_COUNT";
+    }
+    return;
+  }
+
+  if (step === "ASK_PAGE_COUNT") {
     const num = parseInt(msgBody);
     if (!isNaN(num) && num > 0) {
       data.pages = num;
-      await sendMessage(phone, `🔢 *Step 3* — How many *copies* (sets) do you need?\nJust type a number.`);
+      await sendMessage(phone, `🔢 How many copies (sets)?`);
       session.step = "ASK_COPIES";
     } else {
-      await sendMessage(phone, `Please enter a valid number of pages (e.g. 5)`);
+      await sendMessage(phone, `Please enter a valid number (e.g. 5)`);
     }
     return;
   }
@@ -201,148 +266,67 @@ async function handleMessage(phone, msgType, msgBody) {
     const num = parseInt(msgBody);
     if (!isNaN(num) && num > 0) {
       data.copies = num;
-      await sendButtons(phone, `🎨 *Step 4* — Print type?`, [
-        { id: "print_bw", title: "⬛ Black & White" },
-        { id: "print_color", title: "🌈 Color" },
+      await sendButtons(phone, `Paper size?`, [
+        { id: "size_a4", title: "A4" },
+        { id: "size_a3", title: "A3" },
+        { id: "size_letter", title: "Letter" },
       ]);
-      session.step = "ASK_PRINT_TYPE";
+      session.step = "ASK_SIZE";
     } else {
-      await sendMessage(phone, `Please enter a valid number of copies (e.g. 2)`);
+      await sendMessage(phone, `Please enter a valid number (e.g. 2)`);
     }
     return;
   }
 
-  if (step === "ASK_PRINT_TYPE") {
-    if (msgBody === "print_bw") {
-      await sendButtons(phone, `Single side or back-to-back?`, [
-        { id: "bw_single", title: "Single Side" },
-        { id: "bw_back2back", title: "Back-to-Back" },
-      ]);
-      session.step = "ASK_BW_SIDE";
-    } else if (msgBody === "print_color") {
-      await sendButtons(phone, `Plain paper or glossy paper?`, [
-        { id: "color_plain", title: "Plain Paper" },
-        { id: "color_glossy", title: "✨ Glossy Paper" },
-      ]);
-      session.step = "ASK_COLOR_PAPER";
-    } else {
-      await sendButtons(phone, `Please choose print type:`, [
-        { id: "print_bw", title: "⬛ Black & White" },
-        { id: "print_color", title: "🌈 Color" },
-      ]);
-    }
-    return;
-  }
-
-  if (step === "ASK_BW_SIDE") {
-    if (msgBody === "bw_single" || msgBody === "bw_back2back") {
-      data.printType = "bw";
-      data.bwSide = msgBody === "bw_back2back" ? "back2back" : "single";
-      await goToBinding(phone, session);
+  if (step === "ASK_SIZE") {
+    const sizeMap = { size_a4: "A4", size_a3: "A3", size_letter: "Letter" };
+    if (sizeMap[msgBody]) {
+      data.size = sizeMap[msgBody];
+      if (data.service === "binding") {
+        await sendButtons(phone, `Binding type?`, [
+          { id: "bind_spiral", title: "📎 Spiral" },
+          { id: "bind_hard", title: "📕 Hard Binding" },
+        ]);
+        session.step = "ASK_BINDING_TYPE";
+      } else {
+        await askDelivery(phone, session);
+      }
     } else {
       await sendButtons(phone, `Please choose:`, [
-        { id: "bw_single", title: "Single Side" },
-        { id: "bw_back2back", title: "Back-to-Back" },
+        { id: "size_a4", title: "A4" },
+        { id: "size_a3", title: "A3" },
+        { id: "size_letter", title: "Letter" },
       ]);
     }
     return;
   }
 
-  if (step === "ASK_COLOR_PAPER") {
-    if (msgBody === "color_plain" || msgBody === "color_glossy") {
-      data.printType = msgBody;
-      await goToBinding(phone, session);
+  if (step === "ASK_BINDING_TYPE") {
+    if (msgBody === "bind_spiral" || msgBody === "bind_hard") {
+      data.binding = msgBody === "bind_hard" ? "hard" : "spiral";
+      await askDelivery(phone, session);
     } else {
       await sendButtons(phone, `Please choose:`, [
-        { id: "color_plain", title: "Plain Paper" },
-        { id: "color_glossy", title: "✨ Glossy Paper" },
-      ]);
-    }
-    return;
-  }
-
-  if (step === "ASK_BINDING") {
-    const bindMap = { bind_none: "none", bind_spiral: "spiral", bind_hard: "hard" };
-    if (bindMap[msgBody]) {
-      data.binding = bindMap[msgBody];
-      await sendButtons(phone, `✨ *Next* — Need lamination?`, [
-        { id: "lam_none", title: "None" },
-        { id: "lam_card", title: "Card" },
-        { id: "lam_a4", title: "A4 Size" },
-      ]);
-      session.step = "ASK_LAMINATION";
-    } else {
-      await sendButtons(phone, `Please choose binding:`, [
-        { id: "bind_none", title: "None" },
-        { id: "bind_spiral", title: "📎 Spiral Binding" },
+        { id: "bind_spiral", title: "📎 Spiral" },
         { id: "bind_hard", title: "📕 Hard Binding" },
       ]);
     }
     return;
   }
 
-  if (step === "ASK_LAMINATION") {
-    const lamMap = { lam_none: "none", lam_card: "card", lam_a4: "a4" };
-    if (lamMap[msgBody]) {
-      data.lamination = lamMap[msgBody];
-      if (data.lamination === "none") {
-        await askUrgency(phone, session);
-      } else {
-        await sendMessage(phone, `How many items would you like to laminate? Type a number.`);
-        session.step = "ASK_LAMINATION_QTY";
-      }
-    } else {
-      await sendButtons(phone, `Please choose lamination:`, [
-        { id: "lam_none", title: "None" },
-        { id: "lam_card", title: "Card" },
-        { id: "lam_a4", title: "A4 Size" },
-      ]);
-    }
-    return;
-  }
-
-  if (step === "ASK_LAMINATION_QTY") {
-    const num = parseInt(msgBody);
-    if (!isNaN(num) && num > 0) {
-      data.laminationQty = num;
-      await askUrgency(phone, session);
-    } else {
-      await sendMessage(phone, `Please enter a valid number (e.g. 3)`);
-    }
-    return;
-  }
-
-  if (step === "ASK_URGENCY") {
-    const urgMap = { urg_normal: "Normal (1-2 days)", urg_same: "Same Day", urg_express: "Express (2 hrs)" };
-    data.urgency = urgMap[msgBody] || null;
-    if (!data.urgency) {
-      await sendButtons(phone, `How urgent is this order?`, [
-        { id: "urg_normal", title: "Normal (1-2 days)" },
-        { id: "urg_same", title: "⚡ Same Day" },
-        { id: "urg_express", title: "🚀 Express (2 hrs)" },
-      ]);
-      return;
-    }
-    await sendButtons(phone, `🚚 Pickup or home delivery?`, [
-      { id: "del_pickup", title: "🏪 Pick Up" },
-      { id: "del_delivery", title: "🚚 Home Delivery" },
-    ]);
-    session.step = "ASK_DELIVERY";
-    return;
-  }
-
   if (step === "ASK_DELIVERY") {
     if (msgBody === "del_pickup") {
-      data.delivery = "Shop Pickup";
-      await askPayment(phone, session);
+      data.delivery = "Pickup";
+      await showSummary(phone, session);
     } else if (msgBody === "del_delivery") {
       data.delivery = "Home Delivery";
-      await sendMessage(phone, `📍 Please type your *full delivery address*:`);
+      await sendMessage(phone, `🚚 *Delivery slots:* 3–4 PM or 8–9 PM only.`);
+      await sendMessage(phone, `📍 Your delivery address?`);
       session.step = "ASK_ADDRESS";
     } else {
       await sendButtons(phone, `Please choose:`, [
-        { id: "del_pickup", title: "🏪 Pick Up" },
-        { id: "del_delivery", title: "🚚 Home Delivery" },
+        { id: "del_pickup", title: "🏪 Pickup" },
+        { id: "del_delivery", title: "🚚 Delivery" },
       ]);
     }
     return;
@@ -350,37 +334,36 @@ async function handleMessage(phone, msgType, msgBody) {
 
   if (step === "ASK_ADDRESS") {
     data.address = msgBody;
-    await askPayment(phone, session);
+    await sendButtons(phone, `Payment method?`, [
+      { id: "pay_cash", title: "💵 Cash" },
+      { id: "pay_upi", title: "📱 UPI" },
+    ]);
+    session.step = "ASK_PAYMENT";
     return;
   }
 
   if (step === "ASK_PAYMENT") {
-    const payMap = { pay_cash: "Cash", pay_upi: "UPI / GPay", pay_card: "Card" };
-    if (!payMap[msgBody]) {
-      await sendButtons(phone, `Please choose payment method:`, [
+    const payMap = { pay_cash: "Cash", pay_upi: "UPI" };
+    if (payMap[msgBody]) {
+      data.payment = payMap[msgBody];
+      await showSummary(phone, session);
+    } else {
+      await sendButtons(phone, `Please choose:`, [
         { id: "pay_cash", title: "💵 Cash" },
-        { id: "pay_upi", title: "📱 UPI / GPay" },
-        { id: "pay_card", title: "💳 Card" },
+        { id: "pay_upi", title: "📱 UPI" },
       ]);
-      return;
     }
-    data.payment = payMap[msgBody];
-    await sendMessage(phone, buildCustomerSummary(data));
-    await sendButtons(phone, `Does this look correct?`, [
-      { id: "confirm_yes", title: "✅ Yes, confirm!" },
-      { id: "confirm_no", title: "❌ Start over" },
-    ]);
-    session.step = "CONFIRM";
     return;
   }
 
   if (step === "CONFIRM") {
     if (msgBody === "confirm_yes") {
-      const priced = calculatePrice(data); // backend only — never shown to customer
+      const priced = calculatePrice(data);
       await recordOrderStats(priced.totalPrints, priced.total);
-
-      await sendMessage(phone, `🎉 *Order Confirmed!*\n\nWe've received your order and will process it shortly. Thank you for choosing us! 🙏`);
-
+      await sendMessage(
+        phone,
+        `✅ *Order Received!* We'll notify you when it's ready.\n\nWe also offer Lamination (Card/A4) — visit us in-shop! ✨`
+      );
       sessions[phone] = { step: "DONE", data: {} };
     } else {
       sessions[phone] = { step: "WELCOME", data: {} };
@@ -395,31 +378,21 @@ async function handleMessage(phone, msgType, msgBody) {
   }
 }
 
-async function goToBinding(phone, session) {
-  await sendButtons(phone, `📚 *Next* — Need binding?`, [
-    { id: "bind_none", title: "None" },
-    { id: "bind_spiral", title: "📎 Spiral Binding" },
-    { id: "bind_hard", title: "📕 Hard Binding" },
+async function askDelivery(phone, session) {
+  await sendButtons(phone, `Pickup or delivery?`, [
+    { id: "del_pickup", title: "🏪 Pickup" },
+    { id: "del_delivery", title: "🚚 Delivery" },
   ]);
-  session.step = "ASK_BINDING";
+  session.step = "ASK_DELIVERY";
 }
 
-async function askUrgency(phone, session) {
-  await sendButtons(phone, `⚡ How urgent is this order?`, [
-    { id: "urg_normal", title: "Normal (1-2 days)" },
-    { id: "urg_same", title: "⚡ Same Day" },
-    { id: "urg_express", title: "🚀 Express (2 hrs)" },
+async function showSummary(phone, session) {
+  await sendMessage(phone, buildCustomerSummary(session.data));
+  await sendButtons(phone, `Is this correct?`, [
+    { id: "confirm_yes", title: "✅ Yes" },
+    { id: "confirm_no", title: "❌ Start Over" },
   ]);
-  session.step = "ASK_URGENCY";
-}
-
-async function askPayment(phone, session) {
-  await sendButtons(phone, `💳 How would you like to pay?`, [
-    { id: "pay_cash", title: "💵 Cash" },
-    { id: "pay_upi", title: "📱 UPI / GPay" },
-    { id: "pay_card", title: "💳 Card" },
-  ]);
-  session.step = "ASK_PAYMENT";
+  session.step = "CONFIRM";
 }
 
 // ─── DAILY REPORT — 9 PM IST, to OWNER_PHONE, numbers only ─────────────────
@@ -439,10 +412,9 @@ async function sendDailyReport() {
     console.error("Failed to send daily report:", err.message);
   }
 }
-
 cron.schedule("0 21 * * *", sendDailyReport, { timezone: "Asia/Kolkata" });
 
-// ─── WEBHOOK VERIFICATION ─────────────────────────────────────────────────
+// ─── WEBHOOK ────────────────────────────────────────────────────────────
 app.get("/webhook", (req, res) => {
   if (req.query["hub.mode"] === "subscribe" && req.query["hub.verify_token"] === VERIFY_TOKEN) {
     res.status(200).send(req.query["hub.challenge"]);
@@ -451,30 +423,22 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// ─── INCOMING MESSAGES ────────────────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
-    const entry = req.body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-    const message = value?.messages?.[0];
+    const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!message) return;
-
     const phone = message.from;
     const msgType = message.type;
     let msgBody = "";
-
     if (msgType === "text") msgBody = message.text?.body?.trim();
     else if (msgType === "interactive") msgBody = message.interactive?.button_reply?.id || "";
-
     await handleMessage(phone, msgType, msgBody);
   } catch (err) {
     console.error("Error handling message:", err.message);
   }
 });
 
-// Manual trigger for testing the report without waiting for 9 PM
 app.get("/test-report", async (req, res) => {
   await sendDailyReport();
   res.send("Report sent (check owner's WhatsApp)");
